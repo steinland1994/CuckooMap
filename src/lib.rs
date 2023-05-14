@@ -55,16 +55,8 @@ where
     data: Vec<Entry<V>>,
     // Accept any hashable type as key
     k: std::marker::PhantomData<K>,
-}
-
-// A struct that uniquely identifies an egg by indicies, one for the Vec in_nest_ptrs
-// and the other for the Vecs meta and data
-#[doc(hidden)]
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct Loc {
-    ptr_loc: usize,
-    data_loc: usize,
+    // The workhorse vector which holds all possible nest locations during a lookup operation
+    wh_nestlocs: Vec<usize>,
 }
 
 // A struct pointing to an egg's location
@@ -140,6 +132,7 @@ where
         meta.resize_with(tmp2, Default::default);
         let mut data = Vec::<Entry<V>>::with_capacity(tmp2);
         data.resize_with(tmp2, Default::default);
+        let nestlocs = vec![usize::MIN; (nest_grouping_u8 + 1) as usize * branchcap_u8 as usize];
         CuckooMap {
             buildhasher,
             len: 0,
@@ -151,6 +144,7 @@ where
             meta,
             data,
             k: std::marker::PhantomData,
+            wh_nestlocs: nestlocs,
         }
     }
 
@@ -196,20 +190,14 @@ where
         self.len = 0;
     }
 
-    // A previously used, too slow function locating all nests for a hash.
-    // It is retained for its simplicity.
-    #[doc(hidden)]
+    // This function locates all nests for a given hash.
     #[inline]
-    pub fn locate_nests(&self, mut hash: u64) -> Vec<Loc> {
+    fn _locate_nests(&mut self, mut hash: u64) {
         // Calculate a mask large enough to address each nest on each branch
         let mask = u64::pow(2, self.log2_nestcap_u8 as u32) - 1;
         // Calculate the branchsize in number of entries for both the in_nest_ptrs Vec
         // and also the meta + data Vecs
         let bs_ptrs = usize::pow(2, self.log2_nestcap_u8 as u32);
-        let bs_data = usize::pow(2, self.log2_nestcap_u8 as u32) * (self.eggcap_u8 as usize);
-        // Allocate the Vector holding the indicies pointing to each of the hash's nests
-        let mut nest_locs =
-            Vec::<Loc>::with_capacity(self.branchcap_u8 as usize * self.nest_grouping_u8 as usize);
         // Locate one grouping of nests for each of the branches
         for i in 0..self.branchcap_u8 {
             // Get the hash's location on the current branch by masking the hash
@@ -222,14 +210,10 @@ where
                 // Add the nest location on each branch to that branch's offset in the Vec.
                 // Then add the nest's offset in its grouping
                 // and wrap around to the beginning of the branch if the last nest was located at its end.
-                nest_locs.push(Loc {
-                    ptr_loc: (i as usize) * bs_ptrs + ((loc + (n as usize)) % bs_ptrs),
-                    data_loc: (i as usize) * bs_data
-                        + (((loc + (n as usize)) * (self.eggcap_u8 as usize)) % bs_data),
-                });
+                self.wh_nestlocs
+                    .push((i as usize) * bs_ptrs + ((loc + (n as usize)) % bs_ptrs));
             }
         }
-        nest_locs
     }
 
     /// Return this CuckooMap instance's BuildHasher instance
@@ -249,31 +233,37 @@ where
         hasher.finish2()
     }
 
-    // A previous implementation of _get_mut()
-    // It's no longer used because it's slower but retained because it's simple
-    fn _get_mut_oldslow(
+    // An updated implementation of _get_mut(). It tries to locate an egg across all possible nests.
+    //
+    // It returns Ok(References to the Entry and (nest-)metadata) if an Entry with matching hash was found,
+    // it returns an Err((index of nest in in_nest_ptrs, the new entry's hashes)) if there was no match
+    // in case of an Err(), the returned in_nest_ptrs index is determined from the inestloc_onfail parameter,
+    // which is the the index in a Vec holding all possible locations of a hash's nests.
+    fn _get_mut(
         &mut self,
         key: K,
         inestloc_onfail: usize,
     ) -> Result<EntryLocRef<V>, (usize, Finish2)> {
         // Hash the key and locate all nests across all branches
+        // Before locating the nests, the workhorse vector needs to be cleared
         let hash = self.hash_key(key);
-        let nest_locs = self.locate_nests(hash.hash);
+        self.wh_nestlocs.clear();
+        self._locate_nests(hash.hash);
 
         // Iterate over the nests the specified key could be located in
         // (all nests in its group on every branch, wrapping at the branch's end)
-        for loc in nest_locs.clone() {
+        for loc in self.wh_nestlocs.iter() {
             // Iterate over all entries (eggs) in each nest
             // Iteration could be stopped early if a 0 in the meta vector is found (empty spot),
             // because all entries are expected to occupy the first empty spot they encounter.
             // In practice this requires distinguishing deleted entries from empty ones,
             // so stopping early is not supported. Since these tables are expected to be only filled
-            // and never deleted from (outdated entries being overwritten) and load factors of 100%
+            // and rarely deleted from (outdated entries being overwritten) and load factors of 100%
             // being very practical, there might be little use for not just iterating over everything
             for i in 0..(self.eggcap_u8 as usize) {
                 // Check if the u8 in the meta table matches, only then check the actual entry
-                if self.meta[loc.data_loc + i] == (hash.as_u8_nonzero as u8)
-                    && self.data[loc.data_loc + i].hash == hash.hash
+                if self.meta[*loc * self.eggcap_u8 as usize + i] == (hash.as_u8_nonzero as u8)
+                    && self.data[*loc * self.eggcap_u8 as usize + i].hash == hash.hash
                 {
                     // If both the meta hash and entry hash match, return the entry
                     // If the actual key matches (or the expected value) is ignored
@@ -282,9 +272,9 @@ where
                     // such an insertion, the previous value would be returned instead
                     // of being written to the table as well.
                     return Ok(EntryLocRef {
-                        in_nest_ptr: &mut self.in_nest_ptrs[loc.ptr_loc],
-                        meta_entry: &mut self.meta[loc.data_loc + i],
-                        data_entry: &mut self.data[loc.data_loc + i],
+                        in_nest_ptr: &mut self.in_nest_ptrs[*loc],
+                        meta_entry: &mut self.meta[*loc * self.eggcap_u8 as usize + i],
+                        data_entry: &mut self.data[*loc * self.eggcap_u8 as usize + i],
                     });
                 }
             }
@@ -294,16 +284,21 @@ where
         // at the specified index in a "vector holding the 'indexes of all grouped nests across
         // all branches' the requested entry could be located in".
         // Also return the hash (struct Finish2) to avoid having to compute it twice
-        Err((nest_locs[inestloc_onfail].ptr_loc, hash))
+        Err((self.wh_nestlocs[inestloc_onfail], hash))
     }
 
-    // Provides idential functionality to _get_mut_oldslow
+    // Provides idential functionality to _get_mut()
+    //
+    // It is no longer used, due to an older implementation being faster after an update
+    // Since a lot of changes are expected in this part of the code and it is unclear which implementation
+    // turns out to be faster, I'll retain it for now.
+    //
     // It returns Ok(References to the Entry and (nest-)metadata) if an Entry with matching hash was found,
     // it returns an Err((index of nest in in_nest_ptrs, the new entry's hashes)) if there was no match
     // in case of an Err(), the returned in_nest_ptrs index is determined from the inestloc_onfail parameter,
     // which is the the index in a Vec holding all possible locations of a hash's nests.
     #[inline]
-    fn _get_mut(
+    fn _get_mut_gen1(
         &mut self,
         key: K,
         inestloc_onfail: usize,
@@ -689,7 +684,7 @@ mod tests {
     fn insert_get_some_data() {
         //CuckooMap
 
-        let mut cm = CuckooMap::<usize, usize, WhyHash>::new_with_capacity(8, 16, 1, 3);
+        let mut cm = CuckooMap::<usize, usize, WhyHash>::new_with_capacity(16, 12, 1, 3);
         println!("CM capacity: {}", cm.capacity());
         for i in 0..cm.capacity() {
             cm.insert(i, i);
