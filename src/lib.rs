@@ -23,13 +23,14 @@
 //! how little experience I have and the low code quality is likely the reason for the lack of
 //! performance and may improve over time as I'm learning and seeking help and experienced opinions.
 
-use std::hash::{BuildHasher, Hasher};
+use std::hash::{BuildHasher, Hash};
 use whyhash::{Finish2, HasherExt, WhyHash};
 
 /// The datastructure itself and the necessary metadata
 #[derive(Clone)]
-pub struct CuckooMap<V, S>
+pub struct CuckooMap<K, V, S>
 where
+    K: Hash,
     V: Default + Clone,
     S: BuildHasher,
 {
@@ -52,6 +53,8 @@ where
     meta: Vec<u8>,
     // The actual data (eggs)
     data: Vec<Entry<V>>,
+    // Accept any hashable type as key
+    k: std::marker::PhantomData<K>,
 }
 
 // A struct that uniquely identifies an egg by indicies, one for the Vec in_nest_ptrs
@@ -94,8 +97,9 @@ enum LocTrans<T> {
 }
 
 /// The implementation of the datastructure
-impl<V, S> CuckooMap<V, S>
+impl<K, V, S> CuckooMap<K, V, S>
 where
+    K: Hash,
     V: Default + Clone,
     S: BuildHasher,
 {
@@ -126,7 +130,7 @@ where
         nest_grouping_u8: u8,
         branchcap_u8: u8,
         buildhasher: S,
-    ) -> CuckooMap<V, S> {
+    ) -> CuckooMap<K, V, S> {
         let tmp1 = usize::pow(2, log2_nestcap_u8 as u32) * (branchcap_u8 as usize);
         let tmp2 =
             (eggcap_u8 as usize) * usize::pow(2, log2_nestcap_u8 as u32) * (branchcap_u8 as usize);
@@ -146,6 +150,7 @@ where
             in_nest_ptrs,
             meta,
             data,
+            k: std::marker::PhantomData,
         }
     }
 
@@ -238,9 +243,9 @@ where
     /// The returned Struct holds two hashes, one normal u64 and one u64,
     /// which is non-zero when cast to an u8
     #[inline]
-    pub fn hash_key(&self, key: &[u8]) -> Finish2 {
+    pub fn hash_key(&self, key: K) -> Finish2 {
         let mut hasher = self.buildhasher.build_hasher();
-        hasher.write(key);
+        key.hash(&mut hasher);
         hasher.finish2()
     }
 
@@ -248,7 +253,7 @@ where
     // It's no longer used because it's slower but retained because it's simple
     fn _get_mut_oldslow(
         &mut self,
-        key: &[u8],
+        key: K,
         inestloc_onfail: usize,
     ) -> Result<EntryLocRef<V>, (usize, Finish2)> {
         // Hash the key and locate all nests across all branches
@@ -300,7 +305,7 @@ where
     #[inline]
     fn _get_mut(
         &mut self,
-        key: &[u8],
+        key: K,
         inestloc_onfail: usize,
     ) -> Result<EntryLocRef<V>, (usize, Finish2)> {
         // Hash the key. Two hashes are returned: One u64 and one u64 which is non-zero when cast to an u8
@@ -466,7 +471,7 @@ where
     /// it is recommended to use get() instead and handle collisions on insertionby tagging colliding
     /// entries (e.g. a collision counter which is then appended to the key before hashing)
     #[inline]
-    pub fn contains_key(&mut self, key: &[u8]) -> bool {
+    pub fn contains_key(&mut self, key: K) -> bool {
         self._get_mut(key, 0).is_ok()
     }
 
@@ -475,7 +480,7 @@ where
     /// This function can falsely return a non-matching entry if there is a hash collision.
     /// Check contains_key() for details.
     #[inline]
-    pub fn get(&mut self, key: &[u8]) -> Option<&V> {
+    pub fn get(&mut self, key: K) -> Option<&V> {
         match self._get_mut(key, 0) {
             Err(_) => None,
             Ok(x) => Some(&x.data_entry.value),
@@ -491,7 +496,7 @@ where
     /// This function can falsely return a non-matching entry if there is a hash collision.
     /// Check contains_key() for details.
     #[inline]
-    pub fn get_key_value_retainability(&mut self, key: &[u8]) -> Option<(&u64, &V, &u8)> {
+    pub fn get_key_value_retainability(&mut self, key: K) -> Option<(&u64, &V, &u8)> {
         match self._get_mut(key, 0) {
             Err(_) => None,
             Ok(x) => Some((
@@ -507,7 +512,7 @@ where
     /// This function can falsely return a non-matching entry if there is a hash collision.
     /// Check contains_key() for details.
     #[inline]
-    pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut V> {
+    pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
         match self._get_mut(key, 0) {
             Err(_) => None,
             Ok(x) => Some(&mut x.data_entry.value),
@@ -521,7 +526,7 @@ where
     #[inline]
     pub fn get_mut_key_value_retainability(
         &mut self,
-        key: &[u8],
+        key: K,
     ) -> Option<(&mut u64, &mut V, &mut u8)> {
         match self._get_mut(key, 0) {
             Err(_) => None,
@@ -553,7 +558,7 @@ where
     /// 0 is found. This is guaranteed to happen at some point, but may be costly. This entry's value
     /// is then returned as Err(value).
     #[inline]
-    pub fn insert(&mut self, key: &[u8], value: V) -> Result<Option<V>, V> {
+    pub fn insert(&mut self, key: K, value: V) -> Result<Option<V>, V> {
         // Making the compiler happy
         let tmp_eggcap_u8 = self.eggcap_u8;
         // First try to find if an egg with the provided key already exists
@@ -655,8 +660,9 @@ where
 ///
 /// WhyHash is a very easy to understand hash function with a decent distribution and
 /// security. It is ... *"derived"* from wyHash and various ... *"online resources"*.
-impl<V> CuckooMap<V, WhyHash>
+impl<K, V> CuckooMap<K, V, WhyHash>
 where
+    K: Hash,
     V: Default + Clone,
 {
     pub fn new_with_capacity(
@@ -664,7 +670,7 @@ where
         log2_nestcap_u8: u8,
         nest_grouping_u8: u8,
         branchcap_u8: u8,
-    ) -> CuckooMap<V, WhyHash> {
+    ) -> CuckooMap<K, V, WhyHash> {
         Self::new_with_capacity_and_hasher(
             eggcap_u8,
             log2_nestcap_u8,
@@ -683,15 +689,15 @@ mod tests {
     fn insert_get_some_data() {
         //CuckooMap
 
-        let mut cm = CuckooMap::<usize, WhyHash>::new_with_capacity(8, 16, 1, 3);
+        let mut cm = CuckooMap::<usize, usize, WhyHash>::new_with_capacity(8, 16, 1, 3);
         println!("CM capacity: {}", cm.capacity());
         for i in 0..cm.capacity() {
-            cm.insert(&(i as u64).to_le_bytes(), i);
+            cm.insert(i, i);
         }
         println!("CM length:   {}", cm.len());
         let bench_cm = std::time::Instant::now();
         for i in 0..cm.capacity() {
-            if !cm.contains_key(&(i as u64).to_le_bytes()) {
+            if !cm.contains_key(i) {
                 panic!("CM: Key {} not found", i);
             }
         }
