@@ -1,3 +1,5 @@
+Attempt of a new, different implementation
+
 A generalized Implementation of a Cuckoo Map.
 # Cuckoo Maps
 Cuckoo Maps are hash tables in which new entries (here called eggs) displace old colliding entries
