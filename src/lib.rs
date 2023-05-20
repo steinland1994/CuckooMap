@@ -42,7 +42,7 @@ pub trait BranchEntryTrait {
     fn clear(&mut self);
     fn remove(&mut self, hashes: &Finish2) -> Option<Self::E>;
     fn get(&mut self, hashes: &Finish2) -> Option<&mut Self::E>;
-    fn insert(&mut self, entry: Self::E) -> Result<&mut Self::E, Self::E>;
+    fn insert(&mut self, entry: Self::E) -> Option<Self::E>;
 }
 
 #[doc(hidden)]
@@ -56,7 +56,7 @@ pub trait BranchTrait {
     fn clear(&mut self);
     fn remove(&mut self, hashes: &Finish2) -> Option<Self::E>;
     fn get(&mut self, hashes: &Finish2) -> Option<&mut Self::E>;
-    fn insert(&mut self, entry: Self::E) -> Result<&mut Self::E, Self::E>;
+    fn insert(&mut self, entry: Self::E) -> Option<Self::E>;
 }
 
 #[doc(hidden)]
@@ -80,8 +80,9 @@ where
 }
 
 #[doc(hidden)]
-pub struct BranchWithBucketGroups<B>
+pub struct BranchWithBucketGroups<V, B>
 where
+    V: Default + Clone,
     B: BranchEntryTrait,
 {
     hash_rotator: u32,
@@ -91,11 +92,13 @@ where
     cap_buckets: usize,
     length: usize,
     data: Vec<B>,
+    value_type: std::marker::PhantomData<V>,
 }
 
 #[doc(hidden)]
-pub struct BranchWithoutBucketGroups<B>
+pub struct BranchWithoutBucketGroups<V, B>
 where
+    V: Default + Clone,
     B: BranchEntryTrait,
 {
     hash_rotator: u32,
@@ -104,6 +107,7 @@ where
     cap_buckets: usize,
     length: usize,
     data: Vec<B>,
+    value_type: std::marker::PhantomData<V>,
 }
 
 pub struct CuckooMap<K, V>
@@ -124,8 +128,8 @@ where
         num_branches: u8,
         log2_branch_size: u8,
         bucket_size: u8,
-    ) -> PrvCuckooMap<K, V, WhyHash, BranchWithoutBucketGroups<Bucket<V>>> {
-        PrvCuckooMap::<K, V, WhyHash, BranchWithoutBucketGroups<Bucket<V>>>::new(
+    ) -> PrvCuckooMap<K, V, WhyHash, BranchWithoutBucketGroups<V, Bucket<V>>> {
+        PrvCuckooMap::<K, V, WhyHash, BranchWithoutBucketGroups<V, Bucket<V>>>::new(
             num_branches,
             log2_branch_size,
             bucket_size,
@@ -141,7 +145,7 @@ where
     K: Hash,
     V: Default + Clone,
     S: BuildHasher,
-    M: BranchTrait,
+    M: BranchTrait<E = Entry<V>>,
 {
     //
     key: std::marker::PhantomData<K>,
@@ -155,7 +159,7 @@ where
     K: Hash,
     V: Default + Clone,
     S: BuildHasher,
-    M: BranchTrait,
+    M: BranchTrait<E = Entry<V>>,
 {
     fn new(
         num_branches: u8,
@@ -177,6 +181,60 @@ where
                 bucket_grouping,
                 i as u32 * log2_branch_size as u32,
             ));
+        }
+        ret
+    }
+    pub fn hash_key(&self, key: K) -> Finish2 {
+        let mut hasher = self.buildhasher.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish2()
+    }
+
+    fn get_mut_int(&mut self, f2: &Finish2) -> Option<&mut Entry<V>> {
+        let mut ret = None;
+        for b in self.branches.iter_mut() {
+            match b.get(f2) {
+                None => {}
+                Some(x) => {
+                    ret = Some(x);
+                    break;
+                }
+            }
+        }
+        ret
+    }
+
+    pub fn get_mut(&mut self, key: K) -> Option<&mut Entry<V>> {
+        self.get_mut_int(&self.hash_key(key))
+    }
+
+    pub fn get(&mut self, key: K) -> Option<&Entry<V>> {
+        match self.get_mut_int(&self.hash_key(key)) {
+            None => None,
+            Some(x) => Some(&*x),
+        }
+    }
+
+    pub fn insert(&mut self, key: K, value: V, depth: u32) -> Result<Option<Entry<V>>, Entry<V>> {
+        let hashes = self.hash_key(key);
+        let mut ret: Result<Option<Entry<V>>, Entry<V>> = Ok(None);
+        let mut b_not_found = true;
+        if let Some(x) = self.get_mut_int(&hashes) {
+            ret = Ok(Some(x.clone()));
+            b_not_found = false;
+        }
+
+        let mut entry = Entry { hashes, value };
+        if b_not_found {
+            for _i in 0..depth {
+                for b in self.branches.iter_mut() {
+                    match b.insert(entry) {
+                        None => return Ok(None),
+                        Some(x) => entry = x,
+                    }
+                }
+            }
+            ret = Err(entry);
         }
         ret
     }
@@ -245,14 +303,14 @@ where
         }
     }
 
-    fn insert(&mut self, entry: Self::E) -> Result<&mut Self::E, Self::E> {
+    fn insert(&mut self, entry: Self::E) -> Option<Self::E> {
         if self.hashes.as_u8_nonzero == 0 {
             *self = entry;
-            Ok(self)
+            None
         } else {
             let tmp = self.clone();
             *self = entry;
-            Err(tmp)
+            Some(tmp)
         }
     }
 }
@@ -332,25 +390,26 @@ where
         None
     }
 
-    fn insert(&mut self, entry: Self::E) -> Result<&mut Self::E, Self::E> {
+    fn insert(&mut self, entry: Self::E) -> Option<Self::E> {
         if self.meta[self.displace_index as usize] == 0 {
             self.meta[self.displace_index as usize] = entry.hashes().as_u8_nonzero as u8;
             self.data[self.displace_index as usize] = entry;
-            Ok(&mut self.data[self.displace_index as usize])
+            None
         } else {
             let tmp = self.data[self.displace_index as usize].clone();
             self.meta[self.displace_index as usize] = entry.hashes().as_u8_nonzero as u8;
             self.data[self.displace_index as usize] = entry;
-            Err(tmp)
+            Some(tmp)
         }
     }
 }
 
-impl<B> BranchTrait for BranchWithBucketGroups<B>
+impl<V, B> BranchTrait for BranchWithBucketGroups<V, B>
 where
-    B: BranchEntryTrait,
+    V: Default + Clone,
+    B: BranchEntryTrait<E = Entry<V>>,
 {
-    type E = B::E;
+    type E = Entry<V>;
     type BE = B;
 
     fn new(
@@ -367,6 +426,7 @@ where
             cap_buckets: usize::pow(2, log2_bucketcap as u32),
             length: 0,
             data: Vec::with_capacity(usize::pow(2, log2_bucketcap as u32)),
+            value_type: std::marker::PhantomData,
         };
         for _i in 0..ret.cap_buckets {
             ret.data.push(Self::BE::new(bucket_entrycap));
@@ -419,12 +479,15 @@ where
         None
     }
 
-    fn insert(&mut self, entry: Self::E) -> Result<&mut Self::E, Self::E> {
+    fn insert(&mut self, entry: Self::E) -> Option<Self::E> {
         let hl = hash_loc(entry.hashes().hash, self.mask, self.hash_rotator);
         let mut ind_insert = hl;
         for i in hl..(hl + self.bucket_grouping as usize + 1) {
             let i = i % self.cap_buckets;
-            if self.data[i].ptr_displace() < self.data[ind_insert].ptr_displace() {
+            if (self.data[i].ptr_displace() < self.data[ind_insert].ptr_displace())
+                | (self.data[ind_insert].ptr_displace() == 0
+                    && self.data[i].ptr_displace() >= self.bucket_entrycap - 1)
+            {
                 ind_insert = i;
             }
             if !self.data[i].is_full() {
@@ -437,11 +500,12 @@ where
     }
 }
 
-impl<B> BranchTrait for BranchWithoutBucketGroups<B>
+impl<V, B> BranchTrait for BranchWithoutBucketGroups<V, B>
 where
-    B: BranchEntryTrait,
+    V: Default + Clone,
+    B: BranchEntryTrait<E = Entry<V>>,
 {
-    type E = B::E;
+    type E = Entry<V>;
     type BE = B;
 
     fn new(
@@ -457,6 +521,7 @@ where
             cap_buckets: usize::pow(2, log2_bucketcap as u32),
             length: 0,
             data: Vec::with_capacity(usize::pow(2, log2_bucketcap as u32)),
+            value_type: std::marker::PhantomData,
         };
         for _i in 0..ret.cap_buckets {
             ret.data.push(Self::BE::new(bucket_entrycap));
@@ -496,7 +561,7 @@ where
         }
     }
 
-    fn insert(&mut self, entry: Self::E) -> Result<&mut Self::E, Self::E> {
+    fn insert(&mut self, entry: Self::E) -> Option<Self::E> {
         self.data[hash_loc(entry.hashes().hash, self.mask, self.hash_rotator)].insert(entry)
     }
 }
