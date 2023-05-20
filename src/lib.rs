@@ -684,10 +684,13 @@ mod tests {
     fn insert_get_some_data() {
         //CuckooMap
 
-        let mut cm = CuckooMap::<usize, usize, WhyHash>::new_with_capacity(16, 12, 1, 3);
+        let mut cm = CuckooMap::<usize, usize, WhyHash>::new_with_capacity(16, 16, 0, 3);
         println!("CM capacity: {}", cm.capacity());
         for i in 0..cm.capacity() {
-            cm.insert(i, i);
+            match cm.insert(i, i) {
+                Ok(_) => {}
+                Err(x) => panic!("Key displaced: {}", x),
+            }
         }
         println!("CM length:   {}", cm.len());
         let bench_cm = std::time::Instant::now();
