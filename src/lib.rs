@@ -597,6 +597,8 @@ mod tests {
     fn insert_then_get() {
         let mut cm = CuckooMap::<u64, u64>::new_with_buckets(3, 16, 16);
 
+        println!("CM capacity: {}", cm.capacity());
+
         let test_size = (cm.capacity() as f64 * 0.98) as u64;
 
         println!("Starting inserting");
