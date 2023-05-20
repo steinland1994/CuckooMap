@@ -154,6 +154,7 @@ where
     branches: Vec<M>,
 }
 
+// ############################################################################################################
 impl<K, V, S, M> PrvCuckooMap<K, V, S, M>
 where
     K: Hash,
@@ -188,6 +189,22 @@ where
         let mut hasher = self.buildhasher.build_hasher();
         key.hash(&mut hasher);
         hasher.finish2()
+    }
+
+    pub fn capacity(&self) -> usize {
+        let mut ret = 0;
+        for b in self.branches.iter() {
+            ret += b.capacity();
+        }
+        ret
+    }
+
+    pub fn length(&self) -> usize {
+        let mut ret = 0;
+        for b in self.branches.iter() {
+            ret += b.length();
+        }
+        ret
     }
 
     fn get_mut_int(&mut self, f2: &Finish2) -> Option<&mut Entry<V>> {
@@ -239,6 +256,8 @@ where
         ret
     }
 }
+
+// ___________________________________________________________________________________________________________
 
 fn eq_fin2(f1: &Finish2, f2: &Finish2) -> bool {
     f1.as_u8_nonzero == f2.as_u8_nonzero && f1.hash == f2.hash
@@ -394,11 +413,13 @@ where
         if self.meta[self.displace_index as usize] == 0 {
             self.meta[self.displace_index as usize] = entry.hashes().as_u8_nonzero as u8;
             self.data[self.displace_index as usize] = entry;
+            self.displace_index = ((self.displace_index as usize + 1) % self.meta.len()) as u8;
             None
         } else {
             let tmp = self.data[self.displace_index as usize].clone();
             self.meta[self.displace_index as usize] = entry.hashes().as_u8_nonzero as u8;
             self.data[self.displace_index as usize] = entry;
+            self.displace_index = ((self.displace_index as usize + 1) % self.meta.len()) as u8;
             Some(tmp)
         }
     }
@@ -563,5 +584,54 @@ where
 
     fn insert(&mut self, entry: Self::E) -> Option<Self::E> {
         self.data[hash_loc(entry.hashes().hash, self.mask, self.hash_rotator)].insert(entry)
+    }
+}
+
+// ##############################################################################################################
+
+#[cfg(test)]
+mod tests {
+    use super::CuckooMap;
+
+    #[test]
+    fn insert_then_get() {
+        let mut cm = CuckooMap::<u64, u64>::new_with_buckets(3, 16, 16);
+
+        let test_size = (cm.capacity() as f64 * 0.98) as u64;
+
+        println!("Starting inserting");
+
+        let bcmi = std::time::Instant::now();
+
+        for i in 0..test_size {
+            match cm.insert(i, i, 200) {
+                Ok(_) => {}
+                Err(x) => panic!("Key displaced: {}", x.value),
+            }
+        }
+
+        let bcmif = bcmi.elapsed();
+
+        println!("Finished inserting, starting getting");
+
+        let bcmg = std::time::Instant::now();
+
+        for i in 0..test_size {
+            if cm.get(i).is_none() {
+                panic!("Key not found: {}", i);
+            }
+        }
+
+        let bcmgf = bcmg.elapsed();
+
+        println!("Finished getting, Results:");
+        println!(
+            "M In/s CM: {}",
+            test_size as f64 / bcmif.as_secs_f64() / 1_000_000.0
+        );
+        println!(
+            "M Lu/s CM: {}",
+            test_size as f64 / bcmgf.as_secs_f64() / 1_000_000.0
+        );
     }
 }
